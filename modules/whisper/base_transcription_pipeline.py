@@ -10,6 +10,7 @@ from datetime import datetime
 from faster_whisper.vad import VadOptions
 import gc
 from copy import deepcopy
+import time
 
 from modules.uvr.music_separator import MusicSeparator
 from modules.utils.paths import (WHISPER_MODELS_DIR, DIARIZATION_MODELS_DIR, OUTPUT_DIR, DEFAULT_PARAMETERS_CONFIG_PATH,
@@ -19,6 +20,7 @@ from modules.utils.logger import get_logger
 from modules.utils.subtitle_manager import *
 from modules.utils.youtube_manager import get_ytdata, get_ytaudio
 from modules.utils.files_manager import get_media_files, format_gradio_files, load_yaml, save_yaml, read_file
+from modules.utils.audio_manager import validate_audio
 from modules.whisper.data_classes import *
 from modules.diarize.diarizer import Diarizer
 from modules.vad.silero_vad import SileroVAD
@@ -108,6 +110,11 @@ class BaseTranscriptionPipeline(ABC):
         elapsed_time: float
             elapsed time for running
         """
+        start_time = time.time()
+
+        if not validate_audio(audio):
+            return [Segment()], 0
+
         params = TranscriptionPipelineParams.from_list(list(pipeline_params))
         params = self.validate_gradio_values(params)
         bgm_params, vad_params, whisper_params, diarization_params = params.bgm_separation, params.vad, params.whisper, params.diarization
@@ -132,10 +139,12 @@ class BaseTranscriptionPipeline(ABC):
 
             if bgm_params.enable_offload:
                 self.music_separator.offload()
+            elapsed_time_bgm_sep = time.time() - start_time
 
         origin_audio = deepcopy(audio)
 
         if vad_params.vad_filter:
+            progress(0, desc="Filtering silent parts from audio..")
             vad_options = VadOptions(
                 threshold=vad_params.threshold,
                 min_speech_duration_ms=vad_params.min_speech_duration_ms,
@@ -155,11 +164,13 @@ class BaseTranscriptionPipeline(ABC):
             else:
                 vad_params.vad_filter = False
 
-        result, elapsed_time = self.transcribe(
+        result, elapsed_time_transcription = self.transcribe(
             audio,
             progress,
             *whisper_params.to_list()
         )
+        if whisper_params.enable_offload:
+            self.offload()
 
         if vad_params.vad_filter:
             restored_result = self.vad.restore_speech_timestamps(
@@ -172,20 +183,29 @@ class BaseTranscriptionPipeline(ABC):
                 logger.info("VAD detected no speech segments in the audio.")
 
         if diarization_params.is_diarize:
+            progress(0.99, desc="Diarizing speakers..")
             result, elapsed_time_diarization = self.diarizer.run(
                 audio=origin_audio,
-                use_auth_token=diarization_params.hf_token,
+                use_auth_token=diarization_params.hf_token if diarization_params.hf_token else os.environ.get("HF_TOKEN"),
                 transcribed_result=result,
                 device=diarization_params.diarization_device
             )
-            elapsed_time += elapsed_time_diarization
+            if diarization_params.enable_offload:
+                self.diarizer.offload()
 
         self.cache_parameters(
             params=params,
             file_format=file_format,
             add_timestamp=add_timestamp
         )
-        return result, elapsed_time
+
+        if not result:
+            logger.info(f"Whisper did not detected any speech segments in the audio.")
+            result = [Segment()]
+
+        progress(1.0, desc="Finished.")
+        total_elapsed_time = time.time() - start_time
+        return result, total_elapsed_time
 
     def transcribe_file(self,
                         files: Optional[List] = None,
